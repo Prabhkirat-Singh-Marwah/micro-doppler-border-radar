@@ -96,6 +96,17 @@ def _init_state():
         "data_source"    : "synthetic",
         "snr_db"         : 15.0,
         "total_steps"    : 0,
+        # ── Radar Visualizer state ─────────────────────────────────
+        "last_signal"    : None,       # most recent raw time-domain signal (512,)
+        "last_spec"      : None,       # most recent 2D spectrogram (64, 64)
+        "last_class"     : "",         # class name of last detection
+        "last_conf"      : 0.0,        # confidence of last detection
+        "last_peak_f"    : 0.0,        # peak Doppler freq of last detection (Hz)
+        # Waterfall: deque of FFT magnitude rows (each shape 257,)
+        # — 40 rows × 257 freq bins — scrolls upward like a real radar waterfall
+        "fft_waterfall"  : None,
+        # PPI scope: list of dicts {azimuth, range, threat_score, class_name, status}
+        "ppi_tracks"     : [],
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -200,6 +211,41 @@ def run_one_step():
 
     st.session_state.total_steps += 1
 
+    # ── 10. Update Radar Visualizer state ────────────────────────
+    # Save raw signal and spectrogram for the visualizer tab
+    st.session_state.last_signal = raw_sig
+    st.session_state.last_spec   = spec[0]   # drop channel dim → (64, 64)
+    st.session_state.last_class  = class_name
+    st.session_state.last_conf   = confidence
+    st.session_state.last_peak_f = peak_f
+
+    # Compute full FFT magnitude row and push to waterfall deque
+    # rfft gives 257 bins for 512-sample signal (0 Hz … 500 Hz)
+    from collections import deque
+    if st.session_state.fft_waterfall is None:
+        st.session_state.fft_waterfall = deque(maxlen=40)
+    fft_mag = np.abs(np.fft.rfft(raw_sig))          # shape (257,)
+    fft_log = 10 * np.log10(fft_mag ** 2 + 1e-9)   # log power
+    st.session_state.fft_waterfall.append(fft_log)
+
+    # Simulate a random azimuth bearing for the PPI scope
+    # In a real system this comes from the antenna scan angle
+    azimuth = float(rng.uniform(0, 360))
+    rng_km  = float(rng.uniform(0.5, 8.0))          # simulated range 0.5–8 km
+    track = {
+        "azimuth"     : azimuth,
+        "range_km"    : rng_km,
+        "threat_score": threat_score,
+        "class_name"  : class_name,
+        "status"      : detection.status,
+        "confidence"  : confidence,
+        "threat_level": threat_level,
+    }
+    st.session_state.ppi_tracks.append(track)
+    # Keep only the last 60 tracks on the PPI scope (older ones fade)
+    if len(st.session_state.ppi_tracks) > 60:
+        st.session_state.ppi_tracks = st.session_state.ppi_tracks[-60:]
+
 
 # ── Helper: build detections DataFrame ────────────────────────────────────
 
@@ -277,7 +323,7 @@ with st.sidebar:
         else:
             st.warning("⚠️ No saved weights. Will train on first run (~3 min).")
 
-        if st.button("🔧 Load / Train Model", use_container_width=True):
+        if st.button("🔧 Load / Train Model", width='stretch'):
             with st.spinner("Loading / training model (CPU only)..."):
                 model, history = get_trained_model(st.session_state.snr_db)
                 st.session_state.model         = model
@@ -291,7 +337,7 @@ with st.sidebar:
             final = st.session_state.training_log[-1]
             st.metric("Val Accuracy", f"{final['val_acc']:.1%}")
 
-    if st.button("🗑️ Retrain (delete weights)", use_container_width=True,
+    if st.button("🗑️ Retrain (delete weights)", width='stretch',
                  disabled=not st.session_state.model_trained):
         if os.path.exists(DEFAULT_WEIGHTS_PATH):
             os.remove(DEFAULT_WEIGHTS_PATH)
@@ -309,17 +355,17 @@ with st.sidebar:
     else:
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("▶ Start", use_container_width=True,
+            if st.button("▶ Start", width='stretch',
                          disabled=st.session_state.running):
                 st.session_state.running = True
                 st.rerun()
         with col2:
-            if st.button("⏹ Stop", use_container_width=True,
+            if st.button("⏹ Stop", width='stretch',
                          disabled=not st.session_state.running):
                 st.session_state.running = False
                 st.rerun()
 
-        if st.button("🔄 Reset", use_container_width=True):
+        if st.button("🔄 Reset", width='stretch'):
             st.session_state.running      = False
             st.session_state.detections   = []
             st.session_state.triage_agent = TriageAgent()
@@ -371,8 +417,9 @@ elif st.session_state.running and not st.session_state.model_trained:
     st.session_state.running = False
 
 # ── Tabs ─────────────────────────────────────────────────────────────────
-tab_feed, tab_alerts, tab_chart, tab_about = st.tabs(
-    ["📋 Live Detection Feed", "🚨 Escalated Alerts", "📈 Trend Chart", "ℹ️ About"]
+tab_feed, tab_alerts, tab_chart, tab_radar, tab_about = st.tabs(
+    ["📋 Live Detection Feed", "🚨 Escalated Alerts", "📈 Trend Chart",
+     "📡 Radar Visualizer", "ℹ️ About"]
 )
 
 # ══════════════════════════════════════════
@@ -397,7 +444,7 @@ with tab_feed:
                 return [""] * len(row)
 
         styled_df = df.style.apply(highlight_row, axis=1)
-        st.dataframe(styled_df, use_container_width=True, height=400)
+        st.dataframe(styled_df, width='stretch', height=400)
 
     # Class distribution breakdown
     if detections:
@@ -464,13 +511,13 @@ with tab_alerts:
 
                     with cols_a[2]:
                         if st.button("✅ Accept", key=f"accept_{alert.alert_id}",
-                                     use_container_width=True):
+                                     width='stretch'):
                             agent.accept_alert(alert.alert_id)
                             st.rerun()
 
                     with cols_a[3]:
                         if st.button("❌ Dismiss", key=f"dismiss_{alert.alert_id}",
-                                     use_container_width=True):
+                                     width='stretch'):
                             agent.dismiss_alert(alert.alert_id)
                             st.rerun()
         else:
@@ -548,7 +595,7 @@ with tab_chart:
             height=300,
             margin=dict(l=40, r=20, t=50, b=40),
         )
-        st.plotly_chart(fig_threat, use_container_width=True)
+        st.plotly_chart(fig_threat, width='stretch')
 
         # ── Detection class distribution pie ──────────────────────
         col_pie, col_conf = st.columns(2)
@@ -563,7 +610,7 @@ with tab_chart:
                 color_discrete_sequence=px.colors.qualitative.Bold,
             )
             fig_pie.update_layout(height=300, margin=dict(l=20, r=20, t=50, b=20))
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width='stretch')
 
         with col_conf:
             # Confidence histogram
@@ -588,7 +635,7 @@ with tab_chart:
                 xaxis_title="Classifier Confidence",
                 yaxis_title="Count",
             )
-            st.plotly_chart(fig_conf, use_container_width=True)
+            st.plotly_chart(fig_conf, width='stretch')
 
         # ── Status counts over time ───────────────────────────────
         st.markdown("**Status count over session:**")
@@ -604,10 +651,336 @@ with tab_chart:
             )
 
 
+
+# ══════════════════════════════════════════════════════════════
+# TAB 4: RADAR VISUALIZER
+# Live signal charts: waterfall, spectrogram, Doppler FFT, PPI
+# ══════════════════════════════════════════════════════════════
+with tab_radar:
+    st.subheader("📡 Live Radar Signal Visualizer")
+
+    if st.session_state.last_signal is None:
+        st.info("⏳ Start the simulation to see live radar signal charts.")
+    else:
+        sig      = st.session_state.last_signal        # (512,)
+        spec_2d  = st.session_state.last_spec          # (64, 64)
+        cls_name = st.session_state.last_class
+        conf     = st.session_state.last_conf
+        peak_f   = st.session_state.last_peak_f
+        peak_v   = doppler_to_velocity(peak_f)
+
+        # ── Detection badge ───────────────────────────────────────
+        threat_col = {"CRITICAL":"#FF0000","HIGH":"#FF6600",
+                      "MEDIUM":"#FFB300","LOW":"#00AA44"}
+        last_det = detections[-1] if detections else None
+        lvl_color = threat_col.get(last_det.threat_level if last_det else "LOW", "#888")
+
+        badge_cols = st.columns(5)
+        badge_cols[0].markdown(f"**🎯 Target**")
+        badge_cols[0].markdown(f"### {cls_name.replace('_',' ').title()}")
+        badge_cols[1].markdown("**🎲 Confidence**")
+        badge_cols[1].markdown(f"### {conf:.0%}")
+        badge_cols[2].markdown("**⚡ Peak Doppler**")
+        badge_cols[2].markdown(f"### {peak_f:.1f} Hz")
+        badge_cols[3].markdown("**🚀 Est. Velocity**")
+        badge_cols[3].markdown(f"### {peak_v:.2f} m/s")
+        badge_cols[4].markdown("**🔥 Threat**")
+        if last_det:
+            badge_cols[4].markdown(
+                f"<span style='color:{lvl_color};font-size:1.4em;font-weight:bold'>"
+                f"{last_det.threat_level} ({last_det.threat_score:.1f}/10)</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            badge_cols[4].markdown("### —")
+
+        st.markdown("---")
+
+        # ══════════════════════════════════════════════════════════
+        # ROW 1: Waterfall (left) + Current Spectrogram (right)
+        # ══════════════════════════════════════════════════════════
+        col_wf, col_spec = st.columns(2)
+
+        # ── Waterfall display ─────────────────────────────────────
+        with col_wf:
+            st.markdown("#### 🌊 Doppler Waterfall")
+            st.caption("Each row = one scan. Newest at top. Frequency → horizontal axis.")
+
+            wf_deque = st.session_state.fft_waterfall
+            if wf_deque and len(wf_deque) >= 2:
+                # Build 2-D array: rows = time (newest first), cols = freq bins
+                waterfall_arr = np.array(list(reversed(wf_deque)))  # (N, 257)
+                n_rows, n_cols = waterfall_arr.shape
+
+                # Frequency axis: 0 → 500 Hz (rfft of 512 @ 1 kHz)
+                freqs = np.linspace(0, PRF / 2, n_cols)
+
+                fig_wf = go.Figure(go.Heatmap(
+                    z=waterfall_arr,
+                    x=freqs,
+                    y=list(range(n_rows)),
+                    colorscale="Plasma",
+                    showscale=True,
+                    colorbar=dict(title="dB", thickness=12, len=0.8),
+                    zsmooth="best",
+                ))
+                # Mark the peak Doppler frequency as a vertical line
+                fig_wf.add_vline(
+                    x=peak_f, line_color="cyan", line_width=2, line_dash="dash",
+                    annotation_text=f"Peak: {peak_f:.0f} Hz",
+                    annotation_font_color="cyan",
+                )
+                fig_wf.update_layout(
+                    template="plotly_dark",
+                    height=320,
+                    margin=dict(l=10, r=10, t=30, b=40),
+                    xaxis=dict(title="Doppler Frequency (Hz)", range=[0, 500]),
+                    yaxis=dict(
+                        title="Scan (newest ↑)",
+                        showticklabels=False,
+                    ),
+                    plot_bgcolor="#0a0a1a",
+                    paper_bgcolor="#0a0a1a",
+                )
+                st.plotly_chart(fig_wf, width='stretch')
+            else:
+                st.info("Collecting waterfall data — keep simulation running…")
+
+        # ── STFT Spectrogram heatmap ──────────────────────────────
+        with col_spec:
+            st.markdown("#### 🔬 STFT Micro-Doppler Spectrogram")
+            st.caption("Time → horizontal. Frequency → vertical. Brighter = stronger return.")
+
+            # spec_2d is (64, 64), already log-power normalised to [0,1]
+            # y-axis: 0–500 Hz (freq bins), x-axis: 0–512 ms (time)
+            time_axis = np.linspace(0, SIGNAL_LENGTH / PRF * 1000, 64)   # ms
+            freq_axis = np.linspace(0, PRF / 2, 64)                       # Hz
+
+            fig_spec = go.Figure(go.Heatmap(
+                z=spec_2d,
+                x=time_axis,
+                y=freq_axis,
+                colorscale="Inferno",
+                showscale=True,
+                colorbar=dict(title="Norm.", thickness=12, len=0.8),
+                zsmooth="best",
+            ))
+            # Annotate with class name and confidence
+            fig_spec.add_annotation(
+                x=0.02, y=0.97, xref="paper", yref="paper",
+                text=f"<b>{cls_name.replace('_',' ').title()}</b> ({conf:.0%})",
+                showarrow=False,
+                font=dict(size=13, color="white"),
+                bgcolor="rgba(0,0,0,0.55)",
+                bordercolor="cyan",
+                borderwidth=1,
+            )
+            fig_spec.update_layout(
+                template="plotly_dark",
+                height=320,
+                margin=dict(l=10, r=10, t=30, b=40),
+                xaxis=dict(title="Time (ms)"),
+                yaxis=dict(title="Doppler Frequency (Hz)"),
+                plot_bgcolor="#0a0a1a",
+                paper_bgcolor="#0a0a1a",
+            )
+            st.plotly_chart(fig_spec, width='stretch')
+
+        # ══════════════════════════════════════════════════════════
+        # ROW 2: Doppler Power Spectrum (left) + PPI Scope (right)
+        # ══════════════════════════════════════════════════════════
+        col_fft, col_ppi = st.columns(2)
+
+        # ── Doppler power spectrum ────────────────────────────────
+        with col_fft:
+            st.markdown("#### 📊 Doppler Power Spectrum")
+            st.caption("FFT of current signal. Peak bin gives target radial velocity.")
+
+            fft_mag  = np.abs(np.fft.rfft(sig)) ** 2        # power spectrum
+            fft_db   = 10 * np.log10(fft_mag + 1e-9)        # dB
+            fft_freq = np.fft.rfftfreq(len(sig), d=1.0 / PRF)
+
+            # Smooth with a small moving average for visual clarity
+            kernel   = np.ones(5) / 5
+            fft_smooth = np.convolve(fft_db, kernel, mode="same")
+
+            peak_bin = int(np.argmax(fft_mag[fft_freq > 5]))  # skip DC
+
+            fig_fft = go.Figure()
+            # Filled area under spectrum
+            fig_fft.add_trace(go.Scatter(
+                x=fft_freq, y=fft_smooth,
+                mode="lines",
+                fill="tozeroy",
+                fillcolor="rgba(0, 200, 255, 0.15)",
+                line=dict(color="#00c8ff", width=2),
+                name="Power (dB)",
+            ))
+            # Highlight the peak
+            peak_freq_val = fft_freq[fft_freq > 5][peak_bin]
+            fig_fft.add_vline(
+                x=peak_freq_val, line_color="#ff4444",
+                line_width=2, line_dash="dot",
+                annotation_text=f"Peak {peak_freq_val:.0f} Hz → {doppler_to_velocity(peak_freq_val):.1f} m/s",
+                annotation_font_color="#ff8888",
+            )
+            fig_fft.update_layout(
+                template="plotly_dark",
+                height=320,
+                margin=dict(l=10, r=10, t=30, b=40),
+                xaxis=dict(title="Doppler Frequency (Hz)", range=[0, 500]),
+                yaxis=dict(title="Power (dB)"),
+                plot_bgcolor="#0a0a1a",
+                paper_bgcolor="#0a0a1a",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_fft, width='stretch')
+
+        # ── Radar PPI Scope (Plan Position Indicator) ─────────────
+        with col_ppi:
+            st.markdown("#### 🎯 Radar PPI Scope")
+            st.caption(
+                "Polar plot: angle = azimuth bearing, radius = range (km). "
+                "Colour = threat level. Fades with age."
+            )
+
+            ppi_tracks = st.session_state.ppi_tracks
+            if ppi_tracks:
+                n_tracks = len(ppi_tracks)
+                # Alpha fades older tracks: newest = 1.0, oldest = 0.15
+                alphas = np.linspace(0.15, 1.0, n_tracks)
+
+                # Build per-track colour with alpha
+                LEVEL_RGB = {
+                    "CRITICAL": (255, 0,   0),
+                    "HIGH":     (255, 100, 0),
+                    "MEDIUM":   (255, 180, 0),
+                    "LOW":      (0,   180, 80),
+                }
+                STATUS_SYM = {
+                    "ESCALATED": "star",
+                    "WATCH":     "circle",
+                    "LOGGED":    "circle-open",
+                }
+
+                fig_ppi = go.Figure()
+
+                # Range rings (decorative, like a real radar scope)
+                for r in [2, 4, 6, 8]:
+                    theta_ring = np.linspace(0, 360, 361)
+                    fig_ppi.add_trace(go.Scatterpolar(
+                        r=[r] * 361, theta=theta_ring,
+                        mode="lines",
+                        line=dict(color="rgba(0,255,100,0.12)", width=1),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ))
+
+                # Plot each track
+                for i, track in enumerate(ppi_tracks):
+                    r, g, b = LEVEL_RGB.get(track["threat_level"], (128, 128, 128))
+                    a = alphas[i]
+                    color = f"rgba({r},{g},{b},{a:.2f})"
+                    symbol = STATUS_SYM.get(track["status"], "circle")
+                    size   = 8 + track["threat_score"] * 1.5   # bigger = higher threat
+
+                    fig_ppi.add_trace(go.Scatterpolar(
+                        r=[track["range_km"]],
+                        theta=[track["azimuth"]],
+                        mode="markers",
+                        marker=dict(
+                            color=color,
+                            size=size,
+                            symbol=symbol,
+                            line=dict(color=color, width=1),
+                        ),
+                        name=track["class_name"],
+                        hovertemplate=(
+                            f"<b>{track['class_name'].replace('_',' ').title()}</b><br>"
+                            f"Range: {track['range_km']:.1f} km<br>"
+                            f"Bearing: {track['azimuth']:.0f}°<br>"
+                            f"Threat: {track['threat_score']:.1f}/10 ({track['threat_level']})<br>"
+                            f"Status: {track['status']}<extra></extra>"
+                        ),
+                        showlegend=False,
+                    ))
+
+                # "Origin" — the radar installation
+                fig_ppi.add_trace(go.Scatterpolar(
+                    r=[0], theta=[0], mode="markers",
+                    marker=dict(color="white", size=12, symbol="square"),
+                    name="Radar Site",
+                    hovertemplate="<b>Radar Installation</b><extra></extra>",
+                    showlegend=False,
+                ))
+
+                fig_ppi.update_layout(
+                    polar=dict(
+                        bgcolor="#020d14",
+                        angularaxis=dict(
+                            tickfont=dict(color="#00ff88", size=10),
+                            direction="clockwise",
+                            rotation=90,       # 0° = North
+                            gridcolor="rgba(0,255,100,0.15)",
+                            linecolor="rgba(0,255,100,0.2)",
+                        ),
+                        radialaxis=dict(
+                            range=[0, 9],
+                            tickvals=[2, 4, 6, 8],
+                            ticktext=["2km","4km","6km","8km"],
+                            tickfont=dict(color="#00ff88", size=9),
+                            gridcolor="rgba(0,255,100,0.12)",
+                            linecolor="rgba(0,255,100,0.15)",
+                        ),
+                    ),
+                    template="plotly_dark",
+                    height=320,
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    paper_bgcolor="#020d14",
+                    plot_bgcolor="#020d14",
+                )
+                st.plotly_chart(fig_ppi, width='stretch')
+            else:
+                st.info("PPI scope populates as detections accumulate…")
+
+        # ══════════════════════════════════════════════════════════
+        # ROW 3: Raw time-domain waveform (full width)
+        # ══════════════════════════════════════════════════════════
+        st.markdown("#### 〰️ Raw Time-Domain Signal")
+        st.caption(
+            "The raw simulated radar return before any processing. "
+            "Micro-Doppler modulations are visible as amplitude variations on the carrier."
+        )
+        t_axis = np.linspace(0, SIGNAL_LENGTH / PRF * 1000, SIGNAL_LENGTH)   # ms
+
+        fig_sig = go.Figure()
+        fig_sig.add_trace(go.Scatter(
+            x=t_axis,
+            y=sig,
+            mode="lines",
+            line=dict(color="#00ffcc", width=1),
+            fill="tozeroy",
+            fillcolor="rgba(0,255,200,0.05)",
+            name="Amplitude",
+        ))
+        fig_sig.update_layout(
+            template="plotly_dark",
+            height=200,
+            margin=dict(l=10, r=10, t=20, b=40),
+            xaxis=dict(title="Time (ms)"),
+            yaxis=dict(title="Amplitude"),
+            plot_bgcolor="#0a0a1a",
+            paper_bgcolor="#0a0a1a",
+            showlegend=False,
+        )
+        st.plotly_chart(fig_sig, width='stretch')
+
+
 # ══════════════════════════════════════════
-# TAB 4: ABOUT / REFERENCE
+# TAB 5: ABOUT / REFERENCE
 # ══════════════════════════════════════════
 with tab_about:
+
     st.subheader("ℹ️ System Architecture & Physics Reference")
 
     st.markdown("""
@@ -688,4 +1061,5 @@ if st.session_state.training_log:
             template="plotly_dark",
             height=250,
         )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width='stretch')
+
