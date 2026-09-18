@@ -423,39 +423,213 @@ tab_feed, tab_alerts, tab_chart, tab_radar, tab_about = st.tabs(
 )
 
 # ══════════════════════════════════════════
-# TAB 1: LIVE DETECTION FEED
-# ══════════════════════════════════════════
+# TAB 1: LIVE DETECTION FEED  ─────────────────────────────────────────────
+# Layout: left 55% = detection table  |  right 45% = live mini radar stack
+# The whole page re-renders every 1.5 s via st.rerun(), so BOTH sides update
+# continuously while the simulation is running — no need to switch tabs.
+# ══════════════════════════════════════════════════════════════════════════
 with tab_feed:
-    st.subheader("Live Detection Feed (newest first)")
+    st.subheader("Live Detection Feed")
 
     if not detections:
         st.info("No detections yet. Load the model and start the simulation.")
     else:
-        df = detections_to_df(detections)
+        # ── Two-column split ─────────────────────────────────────
+        col_table, col_viz = st.columns([55, 45])
 
-        # Color-code rows by threat level using Streamlit's native style
-        def highlight_row(row):
-            status = row.get("Status", "")
-            if "ESCALATED" in status:
-                return ["background-color: #3d0000; color: white"] * len(row)
-            elif "WATCH" in status:
-                return ["background-color: #3d2d00; color: white"] * len(row)
+        # ══════════════════════════════════════════════════════════
+        # LEFT: Detection table + class metrics
+        # ══════════════════════════════════════════════════════════
+        with col_table:
+            df = detections_to_df(detections)
+
+            def highlight_row(row):
+                status = row.get("Status", "")
+                if "ESCALATED" in status:
+                    return ["background-color: #3d0000; color: white"] * len(row)
+                elif "WATCH" in status:
+                    return ["background-color: #3d2d00; color: white"] * len(row)
+                else:
+                    return [""] * len(row)
+
+            styled_df = df.style.apply(highlight_row, axis=1)
+            st.dataframe(styled_df, width="stretch", height=370)
+
+            # Class breakdown micro-metrics below the table
+            st.markdown("**Breakdown by class:**")
+            class_counts = {}
+            for d in detections:
+                class_counts[d.class_name] = class_counts.get(d.class_name, 0) + 1
+            mcols = st.columns(len(class_counts))
+            for i, (cls, cnt) in enumerate(class_counts.items()):
+                pct = cnt / len(detections) * 100
+                mcols[i].metric(cls.replace("_", " ").title(), cnt, f"{pct:.0f}%")
+
+        # ══════════════════════════════════════════════════════════
+        # RIGHT: Live mini radar stack  (updates every 1.5 s)
+        # ══════════════════════════════════════════════════════════
+        with col_viz:
+            has_viz = st.session_state.last_signal is not None
+
+            # ── 1. STFT Spectrogram heatmap ───────────────────────
+            st.markdown("##### 🔬 Micro-Doppler Spectrogram  *(latest signal)*")
+            if has_viz:
+                spec_2d   = st.session_state.last_spec          # (64, 64)
+                cls_name  = st.session_state.last_class
+                conf_val  = st.session_state.last_conf
+                time_axis = np.linspace(0, SIGNAL_LENGTH / PRF * 1000, 64)
+                freq_axis = np.linspace(0, PRF / 2, 64)
+
+                fig_s = go.Figure(go.Heatmap(
+                    z=spec_2d, x=time_axis, y=freq_axis,
+                    colorscale="Inferno", showscale=False,
+                    zsmooth="best",
+                ))
+                fig_s.add_annotation(
+                    x=0.02, y=0.97, xref="paper", yref="paper",
+                    text=f"<b>{cls_name.replace('_',' ').title()}</b> {conf_val:.0%}",
+                    showarrow=False,
+                    font=dict(size=12, color="white"),
+                    bgcolor="rgba(0,0,0,0.6)",
+                    bordercolor="cyan", borderwidth=1,
+                )
+                fig_s.update_layout(
+                    template="plotly_dark",
+                    height=195,
+                    margin=dict(l=40, r=8, t=8, b=35),
+                    xaxis=dict(title="Time (ms)", tickfont=dict(size=9)),
+                    yaxis=dict(title="Freq (Hz)", tickfont=dict(size=9)),
+                    plot_bgcolor="#060614",
+                    paper_bgcolor="#060614",
+                )
+                st.plotly_chart(fig_s, width="stretch")
             else:
-                return [""] * len(row)
+                st.caption("_Spectrogram appears here once simulation starts_")
 
-        styled_df = df.style.apply(highlight_row, axis=1)
-        st.dataframe(styled_df, width='stretch', height=400)
+            # ── 2. Doppler power spectrum ─────────────────────────
+            st.markdown("##### 📊 Doppler Power Spectrum")
+            if has_viz:
+                raw_sig  = st.session_state.last_signal
+                peak_f   = st.session_state.last_peak_f
+                fft_mag  = np.abs(np.fft.rfft(raw_sig)) ** 2
+                fft_db   = 10 * np.log10(fft_mag + 1e-9)
+                fft_freq = np.fft.rfftfreq(len(raw_sig), d=1.0 / PRF)
+                fft_smooth = np.convolve(fft_db, np.ones(5) / 5, mode="same")
 
-    # Class distribution breakdown
-    if detections:
-        st.markdown("**Detection breakdown by class:**")
-        class_counts = {}
-        for d in detections:
-            class_counts[d.class_name] = class_counts.get(d.class_name, 0) + 1
-        cols = st.columns(len(class_counts))
-        for i, (cls, cnt) in enumerate(class_counts.items()):
-            pct = cnt / len(detections) * 100
-            cols[i].metric(cls.replace("_", " ").title(), f"{cnt}", f"{pct:.0f}%")
+                # Colour line by detected class for instant visual ID
+                CLASS_COLORS = {
+                    "human_walk": "#44aaff",
+                    "human_run":  "#00ffcc",
+                    "animal":     "#88ff44",
+                    "drone":      "#ff4444",
+                    "vehicle":    "#ffaa00",
+                }
+                line_color = CLASS_COLORS.get(
+                    st.session_state.last_class, "#00c8ff"
+                )
+
+                fig_f = go.Figure()
+                fig_f.add_trace(go.Scatter(
+                    x=fft_freq, y=fft_smooth,
+                    mode="lines",
+                    fill="tozeroy",
+                    fillcolor=line_color.replace(")", ",0.12)").replace("rgb", "rgba"),
+                    line=dict(color=line_color, width=2),
+                ))
+                fig_f.add_vline(
+                    x=peak_f, line_color="#ffffff",
+                    line_width=1.5, line_dash="dot",
+                    annotation_text=f"{peak_f:.0f} Hz",
+                    annotation_font_color="#ffffff",
+                    annotation_font_size=10,
+                )
+                fig_f.update_layout(
+                    template="plotly_dark",
+                    height=170,
+                    margin=dict(l=40, r=8, t=8, b=35),
+                    xaxis=dict(title="Freq (Hz)", range=[0, 500],
+                               tickfont=dict(size=9)),
+                    yaxis=dict(title="dB", tickfont=dict(size=9)),
+                    plot_bgcolor="#060614",
+                    paper_bgcolor="#060614",
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_f, width="stretch")
+            else:
+                st.caption("_Spectrum appears here once simulation starts_")
+
+            # ── 3. Mini PPI scope ─────────────────────────────────
+            st.markdown("##### 🎯 Radar PPI Scope  *(last 60 tracks)*")
+            ppi_tracks = st.session_state.ppi_tracks
+            if ppi_tracks:
+                n_t    = len(ppi_tracks)
+                alphas = np.linspace(0.1, 1.0, n_t)
+                LRGB   = {"CRITICAL":(255,0,0),"HIGH":(255,100,0),
+                           "MEDIUM":(255,180,0),"LOW":(0,180,80)}
+                SSYM   = {"ESCALATED":"star","WATCH":"circle","LOGGED":"circle-open"}
+
+                fig_p = go.Figure()
+                for r_ring in [2, 4, 6, 8]:
+                    fig_p.add_trace(go.Scatterpolar(
+                        r=[r_ring]*361,
+                        theta=list(np.linspace(0, 360, 361)),
+                        mode="lines",
+                        line=dict(color="rgba(0,255,100,0.1)", width=1),
+                        showlegend=False, hoverinfo="skip",
+                    ))
+                for i, tk in enumerate(ppi_tracks):
+                    rc, gc, bc = LRGB.get(tk["threat_level"], (128,128,128))
+                    a     = alphas[i]
+                    col   = f"rgba({rc},{gc},{bc},{a:.2f})"
+                    sym   = SSYM.get(tk["status"], "circle")
+                    sz    = 6 + tk["threat_score"] * 1.2
+                    fig_p.add_trace(go.Scatterpolar(
+                        r=[tk["range_km"]], theta=[tk["azimuth"]],
+                        mode="markers",
+                        marker=dict(color=col, size=sz, symbol=sym,
+                                    line=dict(color=col, width=1)),
+                        hovertemplate=(
+                            f"<b>{tk['class_name'].replace('_',' ').title()}</b><br>"
+                            f"Range: {tk['range_km']:.1f} km | {tk['azimuth']:.0f}°<br>"
+                            f"Threat: {tk['threat_score']:.1f}/10<br>"
+                            f"Status: {tk['status']}<extra></extra>"
+                        ),
+                        showlegend=False,
+                    ))
+                # Radar origin marker
+                fig_p.add_trace(go.Scatterpolar(
+                    r=[0], theta=[0], mode="markers",
+                    marker=dict(color="white", size=8, symbol="square"),
+                    showlegend=False,
+                    hovertemplate="<b>Radar Site</b><extra></extra>",
+                ))
+                fig_p.update_layout(
+                    polar=dict(
+                        bgcolor="#020d14",
+                        angularaxis=dict(
+                            direction="clockwise", rotation=90,
+                            tickfont=dict(color="#00ff88", size=8),
+                            gridcolor="rgba(0,255,100,0.12)",
+                            linecolor="rgba(0,255,100,0.2)",
+                        ),
+                        radialaxis=dict(
+                            range=[0, 9],
+                            tickvals=[2,4,6,8],
+                            ticktext=["2km","4km","6km","8km"],
+                            tickfont=dict(color="#00ff88", size=8),
+                            gridcolor="rgba(0,255,100,0.1)",
+                        ),
+                    ),
+                    template="plotly_dark",
+                    height=260,
+                    margin=dict(l=8, r=8, t=8, b=8),
+                    paper_bgcolor="#020d14",
+                )
+                st.plotly_chart(fig_p, width="stretch")
+            else:
+                st.caption("_PPI scope populates as detections accumulate_")
+
+
 
 
 # ══════════════════════════════════════════
